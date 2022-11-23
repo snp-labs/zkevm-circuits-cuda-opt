@@ -1,0 +1,79 @@
+name: Integration Tests
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  consecutiveness:
+    if: github.event.pull_request.draft == false
+
+    runs-on: ubuntu-latest
+    steps:
+    - uses: mktcode/consecutive-workflow-action@v1
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+  wakeuprunner:
+    if: github.event.pull_request.draft == false
+
+    needs: [consecutiveness]
+    name: Wake up self-hosted runner
+    runs-on: pse-runner
+
+    steps:
+      - uses: actions/checkout@v2
+      - run: |
+          .github/integrationTestsScripts/wakeUpRunner.sh
+
+  integration-tests:
+    if: github.event.pull_request.draft == false
+
+    needs: [wakeuprunner]
+    name: Integration Tests
+    runs-on: integration-tests-runner
+
+    defaults:
+      run:
+        working-directory: ./integration-tests
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          override: false
+      - name: Setup golang
+        uses: actions/setup-go@v3
+        with:
+          go-version: ~1.18
+      # Go cache for building geth-utils
+      - name: Go cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: Cargo cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      # Run an initial build in a separate step to split the build time from execution time
+      - name: Build bins
+        run: cargo build --bin gen_blockchain_data
+      - name: Build tests
+        run: for testname in rpc circuit_input_builder circuits; do cargo test --profile release --test $testname --features $testname --no-run; done
+      - run: ./run.sh --steps "setup"
+      - run: ./run.sh --steps "gendata"
+      - run: ./run.sh --steps "tests" --tests "rpc"
+      - run: ./run.sh --steps "tests" --tests "circuit_input_builder"
+      - run: ./run.sh --steps "tests" --tests "circuits"
+      - run: ./run.sh --steps "cleanup"
