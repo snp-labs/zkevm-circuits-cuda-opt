@@ -22,11 +22,15 @@ use std::num::ParseIntError;
 use std::slice;
 use std::{
     collections::BTreeMap,
-    iter,
+    env, iter, mem,
     ops::{Index, Mul, MulAssign},
 };
 
 use super::{ConstraintSystem, Expression};
+use ark_std::{end_timer, start_timer};
+use colored::Colorize;
+use cuda_driver_wrapper::TupleToAllocInfo;
+use cuda_driver_wrapper::*;
 
 /// Return the index in the polynomial of size `isize` after rotation `rot`.
 fn get_rotation_idx(idx: usize, rot: i32, rot_scale: i32, isize: i32) -> usize {
@@ -290,6 +294,71 @@ impl<C: CurveAffine> Evaluator<C> {
         lookups: &[Vec<lookup::prover::Committed<C>>],
         permutations: &[permutation::prover::Committed<C>],
     ) -> Polynomial<C::ScalarExt, ExtendedLagrangeCoeff> {
+        //
+
+        let use_cuda = match env::var("CUDA") {
+            Ok(val) => val,
+            Err(_) => "no".to_string(),
+        };
+
+        let values = if use_cuda == "1" || use_cuda == "y" || use_cuda == "yes" {
+            let evaluate_h_start_timer =
+                start_timer!(|| format!("evaluate_h(...) using {} ", "CUDA".green().bold()));
+
+            let return_values = self.evaluate_h_with_cuda(
+                pk,
+                advice_polys,
+                instance_polys,
+                challenges,
+                y,
+                beta,
+                gamma,
+                theta,
+                lookups,
+                permutations,
+            );
+
+            end_timer!(evaluate_h_start_timer);
+
+            return_values
+        } else {
+            let evaluate_h_start_timer =
+                start_timer!(|| format!("evaluate_h(...) using {} ", "CPU only".red().bold()));
+
+            let return_values = self.evaluate_h_cpu_only(
+                pk,
+                advice_polys,
+                instance_polys,
+                challenges,
+                y,
+                beta,
+                gamma,
+                theta,
+                lookups,
+                permutations,
+            );
+
+            end_timer!(evaluate_h_start_timer);
+
+            return_values
+        };
+
+        values
+    }
+
+    fn evaluate_h_cpu_only(
+        &self,
+        pk: &ProvingKey<C>,
+        advice_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
+        instance_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
+        challenges: &[C::ScalarExt],
+        y: C::ScalarExt,
+        beta: C::ScalarExt,
+        gamma: C::ScalarExt,
+        theta: C::ScalarExt,
+        lookups: &[Vec<lookup::prover::Committed<C>>],
+        permutations: &[permutation::prover::Committed<C>],
+    ) -> Polynomial<C::ScalarExt, ExtendedLagrangeCoeff> {
         let domain = &pk.vk.domain;
         let size = domain.extended_len();
         let rot_scale = 1 << (domain.extended_k() - domain.k());
@@ -444,6 +513,15 @@ impl<C: CurveAffine> Evaluator<C> {
             }
 
             // Lookups
+
+            let start_timer = start_timer!(|| format!(
+                "{}{}{}{}",
+                "Lookups : lookups.len()=".dimmed(),
+                lookups.len().to_string().dimmed().bold(),
+                ", values.len()=".dimmed(),
+                values.len().to_string().dimmed().bold(),
+            ));
+
             for (n, lookup) in lookups.iter().enumerate() {
                 // Polynomials required for this lookup.
                 // Calculated here so these only have to be kept in memory for the short time
@@ -517,6 +595,398 @@ impl<C: CurveAffine> Evaluator<C> {
                     }
                 });
             }
+
+            end_timer!(start_timer);
+        }
+        values
+    }
+
+    fn evaluate_h_with_cuda(
+        &self,
+        pk: &ProvingKey<C>,
+        advice_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
+        instance_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
+        challenges: &[C::ScalarExt],
+        y: C::ScalarExt,
+        beta: C::ScalarExt,
+        gamma: C::ScalarExt,
+        theta: C::ScalarExt,
+        lookups: &[Vec<lookup::prover::Committed<C>>],
+        permutations: &[permutation::prover::Committed<C>],
+    ) -> Polynomial<C::ScalarExt, ExtendedLagrangeCoeff> {
+        //
+
+        let domain = &pk.vk.domain;
+        let size = domain.extended_len();
+        let rot_scale = 1 << (domain.extended_k() - domain.k());
+        let fixed = &pk.fixed_cosets[..];
+        let extended_omega = domain.get_extended_omega();
+        let isize = size as i32;
+        let one = C::ScalarExt::one();
+        let l0 = &pk.l0;
+        let l_last = &pk.l_last;
+        let l_active_row = &pk.l_active_row;
+        let p = &pk.vk.cs.permutation;
+        let mut values = domain.empty_extended();
+
+        let module_ptx = match env::var("CU_KERNEL") {
+            Ok(cu_kernel_path) => {
+                if std::path::Path::new(cu_kernel_path.as_str()).exists() {
+                    match std::fs::read_to_string(cu_kernel_path) {
+                        Ok(content) => content,
+                        _ => {
+                            return values;
+                        }
+                    }
+                } else {
+                    println!(
+                        "\n{}{}{}\n",
+                        "*** Error : ".red().bold(),
+                        cu_kernel_path.bright_red().bold(),
+                        " file does not exist ***".red().bold()
+                    );
+
+                    return values;
+                }
+            }
+            Err(_) => {
+                println!(
+                    "\n{}{}{}\n",
+                    "*** Error : ".red().bold(),
+                    "CU_KERNEL".bright_red().bold(),
+                    " env variable not found ***".red().bold()
+                );
+
+                return values;
+            }
+        };
+
+        let mut drv_api = DriverInterface::new(ModuleSource::PTX_TEXT(module_ptx));
+        match drv_api.last_error() {
+            Result::SUCCESS => {}
+            error_result => {
+                println!(
+                    "\n{}{}{}\n",
+                    "*** Error in cuda driver wrapper [ ".red().bold(),
+                    error_result.to_string().red().bold(),
+                    " ] ***".red().bold(),
+                );
+                return values;
+            }
+        }
+        drv_api.verbose();
+        let el_size = std::mem::size_of::<C::ScalarExt>();
+        let el_count = values.len();
+        match drv_api.add_allocations(alloc_info![
+            ("values", el_size, el_count),
+            ("table_values", el_size, el_count),
+            ("r_next_list", mem::size_of::<usize>(), el_count),
+            ("r_prev_list", mem::size_of::<usize>(), el_count),
+            ("a_minus_s_list", el_size, el_count),
+            ("product_coset", el_size, el_count),
+            ("permuted_input_coset", el_size, el_count),
+            ("permuted_table_coset", el_size, el_count),
+            ("l0", &l0.values),
+            ("l_active_row", &l_active_row.values),
+            ("l_last", &l_last.values),
+            ("y_beta_gamma_one", &vec![y, beta, gamma, one])
+        ]) {
+            Result::SUCCESS => {}
+            error_result => {
+                println!(
+                    "\n{}{}{}\n",
+                    "*** Error in cuda driver wrapper [ ".red().bold(),
+                    error_result.to_string().red().bold(),
+                    " ] ***".red().bold(),
+                );
+                return values;
+            }
+        }
+
+        // Calculate the advice and instance cosets
+        let advice: Vec<Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>> = advice_polys
+            .iter()
+            .map(|advice_polys| {
+                advice_polys
+                    .iter()
+                    .map(|poly| domain.coeff_to_extended(poly.clone()))
+                    .collect()
+            })
+            .collect();
+        let instance: Vec<Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>> = instance_polys
+            .iter()
+            .map(|instance_polys| {
+                instance_polys
+                    .iter()
+                    .map(|poly| domain.coeff_to_extended(poly.clone()))
+                    .collect()
+            })
+            .collect();
+
+        // Core expression evaluations
+        let num_threads = multicore::current_num_threads();
+        for (((advice, instance), lookups), permutation) in advice
+            .iter()
+            .zip(instance.iter())
+            .zip(lookups.iter())
+            .zip(permutations.iter())
+        {
+            // Custom gates
+            multicore::scope(|scope| {
+                let chunk_size = (size + num_threads - 1) / num_threads;
+                for (thread_idx, values) in values.chunks_mut(chunk_size).enumerate() {
+                    let start = thread_idx * chunk_size;
+                    scope.spawn(move |_| {
+                        let mut eval_data = self.custom_gates.instance();
+                        for (i, value) in values.iter_mut().enumerate() {
+                            let idx = start + i;
+                            *value = self.custom_gates.evaluate(
+                                &mut eval_data,
+                                fixed,
+                                advice,
+                                instance,
+                                challenges,
+                                &beta,
+                                &gamma,
+                                &theta,
+                                &y,
+                                value,
+                                idx,
+                                rot_scale,
+                                isize,
+                            );
+                        }
+                    });
+                }
+            });
+
+            // Permutations
+            let sets = &permutation.sets;
+            if !sets.is_empty() {
+                let blinding_factors = pk.vk.cs.blinding_factors();
+                let last_rotation = Rotation(-((blinding_factors + 1) as i32));
+                let chunk_len = pk.vk.cs.degree() - 2;
+                let delta_start = beta * &C::Scalar::ZETA;
+
+                let first_set = sets.first().unwrap();
+                let last_set = sets.last().unwrap();
+
+                // Permutation constraints
+                parallelize(&mut values, |values, start| {
+                    let mut beta_term = extended_omega.pow_vartime(&[start as u64, 0, 0, 0]);
+                    for (i, value) in values.iter_mut().enumerate() {
+                        let idx = start + i;
+                        let r_next = get_rotation_idx(idx, 1, rot_scale, isize);
+                        let r_last = get_rotation_idx(idx, last_rotation.0, rot_scale, isize);
+
+                        // Enforce only for the first set.
+                        // l_0(X) * (1 - z_0(X)) = 0
+                        *value = *value * y
+                            + ((one - first_set.permutation_product_coset[idx]) * l0[idx]);
+                        // Enforce only for the last set.
+                        // l_last(X) * (z_l(X)^2 - z_l(X)) = 0
+                        *value = *value * y
+                            + ((last_set.permutation_product_coset[idx]
+                                * last_set.permutation_product_coset[idx]
+                                - last_set.permutation_product_coset[idx])
+                                * l_last[idx]);
+                        // Except for the first set, enforce.
+                        // l_0(X) * (z_i(X) - z_{i-1}(\omega^(last) X)) = 0
+                        for (set_idx, set) in sets.iter().enumerate() {
+                            if set_idx != 0 {
+                                *value = *value * y
+                                    + ((set.permutation_product_coset[idx]
+                                        - permutation.sets[set_idx - 1].permutation_product_coset
+                                            [r_last])
+                                        * l0[idx]);
+                            }
+                        }
+                        // And for all the sets we enforce:
+                        // (1 - (l_last(X) + l_blind(X))) * (
+                        //   z_i(\omega X) \prod_j (p(X) + \beta s_j(X) + \gamma)
+                        // - z_i(X) \prod_j (p(X) + \delta^j \beta X + \gamma)
+                        // )
+                        let mut current_delta = delta_start * beta_term;
+                        for ((set, columns), cosets) in sets
+                            .iter()
+                            .zip(p.columns.chunks(chunk_len))
+                            .zip(pk.permutation.cosets.chunks(chunk_len))
+                        {
+                            let mut left = set.permutation_product_coset[r_next];
+                            for (values, permutation) in columns
+                                .iter()
+                                .map(|&column| match column.column_type() {
+                                    Any::Advice(_) => &advice[column.index()],
+                                    Any::Fixed => &fixed[column.index()],
+                                    Any::Instance => &instance[column.index()],
+                                })
+                                .zip(cosets.iter())
+                            {
+                                left *= values[idx] + beta * permutation[idx] + gamma;
+                            }
+
+                            let mut right = set.permutation_product_coset[idx];
+                            for values in columns.iter().map(|&column| match column.column_type() {
+                                Any::Advice(_) => &advice[column.index()],
+                                Any::Fixed => &fixed[column.index()],
+                                Any::Instance => &instance[column.index()],
+                            }) {
+                                right *= values[idx] + current_delta + gamma;
+                                current_delta *= &C::Scalar::DELTA;
+                            }
+
+                            *value = *value * y + ((left - right) * l_active_row[idx]);
+                        }
+                        beta_term *= &extended_omega;
+                    }
+                });
+            }
+
+            // Lookups
+
+            let start_timer = start_timer!(|| format!(
+                "{}{}{}{}",
+                "Lookups : lookups.len()=".dimmed(),
+                lookups.len().to_string().dimmed().bold(),
+                ", values.len()=".dimmed(),
+                values.len().to_string().dimmed().bold(),
+            ));
+
+            let mut table_values: Vec<C::ScalarExt> = vec![C::ScalarExt::zero(); values.len()];
+            let mut r_next_list: Vec<usize> = vec![0; values.len()];
+            let mut r_prev_list: Vec<usize> = vec![0; values.len()];
+            let mut a_minus_s_list: Vec<C::ScalarExt> = vec![C::ScalarExt::zero(); values.len()];
+
+            drv_api.copy_to_device("values", &values.values);
+
+            for (n, lookup) in lookups.iter().enumerate() {
+                // Polynomials required for this lookup.
+                // Calculated here so these only have to be kept in memory for the short time
+                // they are actually needed.
+                let product_coset = pk.vk.domain.coeff_to_extended(lookup.product_poly.clone());
+                let permuted_input_coset = pk
+                    .vk
+                    .domain
+                    .coeff_to_extended(lookup.permuted_input_poly.clone());
+                let permuted_table_coset = pk
+                    .vk
+                    .domain
+                    .coeff_to_extended(lookup.permuted_table_poly.clone());
+
+                for idx in 0..values.len() {
+                    //
+                    let lookup_evaluator = &self.lookups[n];
+                    let mut eval_data = lookup_evaluator.instance();
+
+                    let table_value = lookup_evaluator.evaluate(
+                        &mut eval_data,
+                        fixed,
+                        advice,
+                        instance,
+                        challenges,
+                        &beta,
+                        &gamma,
+                        &theta,
+                        &y,
+                        &C::ScalarExt::zero(),
+                        idx,
+                        rot_scale,
+                        isize,
+                    );
+
+                    let r_next = get_rotation_idx(idx, 1, rot_scale, isize);
+                    let r_prev = get_rotation_idx(idx, -1, rot_scale, isize);
+
+                    let a_minus_s = permuted_input_coset[idx] - permuted_table_coset[idx];
+
+                    table_values[idx] = table_value;
+                    r_next_list[idx] = r_next;
+                    r_prev_list[idx] = r_prev;
+                    a_minus_s_list[idx] = a_minus_s;
+                }
+
+                /*
+                    ---------------------------------------------------------------------------------------
+                    --------------------- Computing this code block in gpu --------------------------------
+                    ---------------------------------------------------------------------------------------
+                    // l_0(X) * (1 - z(X)) = 0
+                    *value = *value * y + ((one - product_coset[idx]) * l0[idx]);
+                    // l_last(X) * (z(X)^2 - z(X)) = 0
+                    *value = *value * y
+                        + ((product_coset[idx] * product_coset[idx] - product_coset[idx])
+                            * l_last[idx]);
+                    // (1 - (l_last(X) + l_blind(X))) * (
+                    //   z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
+                    //   - z(X) (\theta^{m-1} a_0(X) + ... + a_{m-1}(X) + \beta)
+                    //          (\theta^{m-1} s_0(X) + ... + s_{m-1}(X) + \gamma)
+                    // ) = 0
+                    *value = *value * y
+                        + ((product_coset[r_next]
+                            * (permuted_input_coset[idx] + beta)
+                            * (permuted_table_coset[idx] + gamma)
+                            - product_coset[idx] * table_value)
+                            * l_active_row[idx]);
+                    // Check that the first values in the permuted input expression and permuted
+                    // fixed expression are the same.
+                    // l_0(X) * (a'(X) - s'(X)) = 0
+                    *value = *value * y + (a_minus_s * l0[idx]);
+                    // Check that each value in the permuted lookup input expression is either
+                    // equal to the value above it, or the value at the same index in the
+                    // permuted table expression.
+                    // (1 - (l_last + l_blind)) * (a′(X) − s′(X))⋅(a′(X) − a′(\omega^{-1} X)) = 0
+                    *value = *value * y
+                        + (a_minus_s
+                            * (permuted_input_coset[idx] - permuted_input_coset[r_prev])
+                            * l_active_row[idx]);
+                    ---------------------------------------------------------------------------------------
+                    ---------------------------------------------------------------------------------------
+                */
+
+                drv_api.copy_to_device("table_values", &table_values);
+                drv_api.copy_to_device("r_next_list", &r_next_list);
+                drv_api.copy_to_device("r_prev_list", &r_prev_list);
+                drv_api.copy_to_device("a_minus_s_list", &a_minus_s_list);
+                drv_api.copy_to_device("product_coset", &product_coset.values);
+                drv_api.copy_to_device("permuted_input_coset", &permuted_input_coset.values);
+                drv_api.copy_to_device("permuted_table_coset", &permuted_table_coset.values);
+
+                drv_api.launch_kernel(
+                    "compute_evaluate_h_lookups_codeblock",
+                    vec![
+                        "values",
+                        "table_values",
+                        "r_next_list",
+                        "r_prev_list",
+                        "a_minus_s_list",
+                        "product_coset",
+                        "permuted_input_coset",
+                        "permuted_table_coset",
+                        "l0",
+                        "l_active_row",
+                        "l_last",
+                        "y_beta_gamma_one",
+                    ],
+                    values.len(),
+                );
+
+                match drv_api.last_error() {
+                    Result::SUCCESS => {}
+                    error_result => {
+                        println!(
+                            "\n{}{}{}\n",
+                            "*** Error in cuda driver wrapper [ ".red().bold(),
+                            error_result.to_string().red().bold(),
+                            " ] ***".red().bold(),
+                        );
+
+                        return values;
+                    }
+                }
+            }
+
+            drv_api.copy_to_host("values", &mut values.values);
+
+            end_timer!(start_timer);
         }
         values
     }
