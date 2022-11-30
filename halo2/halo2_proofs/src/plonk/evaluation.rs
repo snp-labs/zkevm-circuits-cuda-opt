@@ -629,26 +629,8 @@ impl<C: CurveAffine> Evaluator<C> {
         let p = &pk.vk.cs.permutation;
         let mut values = domain.empty_extended();
 
-        let module_ptx = match env::var("CU_KERNEL") {
-            Ok(cu_kernel_path) => {
-                if std::path::Path::new(cu_kernel_path.as_str()).exists() {
-                    match std::fs::read_to_string(cu_kernel_path) {
-                        Ok(content) => content,
-                        _ => {
-                            return values;
-                        }
-                    }
-                } else {
-                    println!(
-                        "\n{}{}{}\n",
-                        "*** Error : ".red().bold(),
-                        cu_kernel_path.bright_red().bold(),
-                        " file does not exist ***".red().bold()
-                    );
-
-                    return values;
-                }
-            }
+        let cu_kernel_path = match env::var("CU_KERNEL") {
+            Ok(val) => val,
             Err(_) => {
                 println!(
                     "\n{}{}{}\n",
@@ -661,7 +643,7 @@ impl<C: CurveAffine> Evaluator<C> {
             }
         };
 
-        let mut drv_api = DriverInterface::new(ModuleSource::PTX_TEXT(module_ptx));
+        let mut drv_api = DriverInterface::new(ModuleSource::FILE(cu_kernel_path));
         match drv_api.last_error() {
             Result::SUCCESS => {}
             error_result => {
@@ -674,10 +656,10 @@ impl<C: CurveAffine> Evaluator<C> {
                 return values;
             }
         }
-        drv_api.verbose();
+        drv_api.high_verbosity();
         let el_size = std::mem::size_of::<C::ScalarExt>();
         let el_count = values.len();
-        match drv_api.add_allocations(alloc_info![
+        drv_api.add_allocations(alloc_info![
             ("values", el_size, el_count),
             ("table_values", el_size, el_count),
             ("r_next_list", mem::size_of::<usize>(), el_count),
@@ -690,17 +672,10 @@ impl<C: CurveAffine> Evaluator<C> {
             ("l_active_row", &l_active_row.values),
             ("l_last", &l_last.values),
             ("y_beta_gamma_one", &vec![y, beta, gamma, one])
-        ]) {
-            Result::SUCCESS => {}
-            error_result => {
-                println!(
-                    "\n{}{}{}\n",
-                    "*** Error in cuda driver wrapper [ ".red().bold(),
-                    error_result.to_string().red().bold(),
-                    " ] ***".red().bold(),
-                );
-                return values;
-            }
+        ]);
+        if drv_api.error_occured() {
+            drv_api.dump_error();
+            return values;
         }
 
         // Calculate the advice and instance cosets
@@ -858,6 +833,10 @@ impl<C: CurveAffine> Evaluator<C> {
             let mut a_minus_s_list: Vec<C::ScalarExt> = vec![C::ScalarExt::zero(); values.len()];
 
             drv_api.copy_to_device("values", &values.values);
+            if drv_api.error_occured() {
+                drv_api.dump_error();
+                return values;
+            }
 
             for (n, lookup) in lookups.iter().enumerate() {
                 // Polynomials required for this lookup.
@@ -949,6 +928,10 @@ impl<C: CurveAffine> Evaluator<C> {
                 drv_api.copy_to_device("product_coset", &product_coset.values);
                 drv_api.copy_to_device("permuted_input_coset", &permuted_input_coset.values);
                 drv_api.copy_to_device("permuted_table_coset", &permuted_table_coset.values);
+                if drv_api.error_occured() {
+                    drv_api.dump_error();
+                    return values;
+                }
 
                 drv_api.launch_kernel(
                     "compute_evaluate_h_lookups_codeblock",
@@ -969,18 +952,9 @@ impl<C: CurveAffine> Evaluator<C> {
                     values.len(),
                 );
 
-                match drv_api.last_error() {
-                    Result::SUCCESS => {}
-                    error_result => {
-                        println!(
-                            "\n{}{}{}\n",
-                            "*** Error in cuda driver wrapper [ ".red().bold(),
-                            error_result.to_string().red().bold(),
-                            " ] ***".red().bold(),
-                        );
-
-                        return values;
-                    }
+                if drv_api.error_occured() {
+                    drv_api.dump_error();
+                    return values;
                 }
             }
 

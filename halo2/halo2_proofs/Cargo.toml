@@ -55,7 +55,7 @@ blake2b_simd = "1"
 ark-std = { version = "0.3", features = ["print-trace"] }
 colored = "2"
 cuda-driver-wrapper = { git = "https://github.com/snp-labs/simple-cuda-driver-wrapper.git" }
-
+ 
 # Developer tooling dependencies
 plotters = { version = "0.3.0", optional = true }
 tabbycat = { version = "0.1", features = ["attributes"], optional = true }

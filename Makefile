@@ -3,7 +3,7 @@
 CU_KERNEL_DIR       :=${PWD}/cuda-kernel-src
 CU_KERNEL           :=${CU_KERNEL_DIR}/kernel.ptx
 
-DEGREE		:=11
+DEGREE		:=12
 
 test-all :
 	cd zkevm-circuits ; make test-all
@@ -38,3 +38,8 @@ circuit_benches_cuda: evm_bench_cuda state_bench_cuda
 
 ${CU_KERNEL} : ${CU_KERNEL_DIR}/field.h  ${CU_KERNEL_DIR}/evaluate_h.cu ;
 	nvcc -ptx ${CU_KERNEL_DIR}/evaluate_h.cu -o $@ 
+
+
+clean :
+	cd zkevm-circuits ; cargo clean 
+	rm ${CU_KERNEL}
