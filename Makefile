@@ -3,7 +3,7 @@
 CU_KERNEL_DIR       :=${PWD}/cuda-kernel-src
 CU_KERNEL           :=${CU_KERNEL_DIR}/kernel.ptx
 
-DEGREE		:=12
+DEGREE		:=17
 
 test-all :
 	cd zkevm-circuits ; make test-all

@@ -2,6 +2,7 @@
 
 typedef unsigned __int128 u128;
 
+static_assert(sizeof(size_t) == 8);
 static_assert(sizeof(ulong) == 8);
 static_assert(sizeof(ulong2) == 16);
 static_assert(sizeof(ulong4) == 32);
